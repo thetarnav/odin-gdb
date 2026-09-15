@@ -201,6 +201,14 @@ main :: proc () {
 	// [1] = {"DynamicChunked", 1}
 	// [2] = {"DynamicChunked", 2}
 
+	fcda := [dynamic; 100]Foo{{"Dynamic1", 1}, {"Dynamic2", 2}}
+	// (gdb) print fcda
+	// [2]{{"Dynamic1", 1}, {"Dynamic2", 2}} = {{"Dynamic1", 1} = {foo_name = "Dynamic1", value = 1}, {"Dynamic2", 2} = {foo_name = "Dynamic2", value = 2}}
+
+	// (gdb) odin-children fcda
+	// [0] = {"Dynamic1", 1}
+	// [1] = {"Dynamic2", 2}
+
 	str_map: map[string]Foo = {"key1" = {"Value1", 1}}
 	// (gdb) print str_map
 	// map[1]{"key1" = {"Value1", 1}} = {key0 = "key1", ["key1"] = {"Value1", 1} = {foo_name = "Value1", value = 1}, len = 1, cap = 8}

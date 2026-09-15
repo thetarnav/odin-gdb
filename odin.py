@@ -27,6 +27,7 @@ class Odin_Type(enum.Enum):
     Enum      = "enum"
     Bitset    = "bitset"
     SOA_Slice = "soa_dynamic_array"
+    Fixed_Dynamic_Array = "fixed_dynamic_array"
     Other     = "other"
     Union     = "union"
 
@@ -37,6 +38,9 @@ def get_odin_type(t) -> Odin_Type:
 
         if name == "string":
             return Odin_Type.String
+
+        if name.startswith("[dynamic;") and not name.endswith(']'):
+            return Odin_Type.Fixed_Dynamic_Array
 
         if (
             (name.startswith("[]") or name.startswith("[dynamic]")) and
@@ -253,6 +257,73 @@ class Printer_Slice:
             try:
                 for i in range(length):
                     yield ("[%d]" % i, (data + i).dereference())
+            except Exception:
+                return
+        return gen()
+
+    def display_hint(self):
+        return "array"
+
+
+# ------------------------------------------------------------------------------
+# Fixed-Capacity Dynamic Array Values
+#
+# Layout:
+#    struct {
+#        data: [N]T,
+#        len:  int,
+#    }
+#
+# DWARF tag: [dynamic;N]pkg::T (e.g. [dynamic;100]main::Foo).
+# Unlike slices/dynamic arrays, data is an inline array, not a pointer,
+# so there is no nullable address and no null-data branch.
+
+class Printer_Fixed_Capacity_Dynamic_Array:
+    def __init__(self, val) -> None:
+        self.val = val
+
+    def _len_data(self):
+        try:
+            length = int(self.val["len"])
+            data = self.val["data"]
+        except gdb.error:
+            return None, None
+        if length < 0:
+            length = 0
+        try:
+            lo, hi = data.type.strip_typedefs().range()
+            capacity = hi - lo + 1
+        except Exception:
+            capacity = length
+        if length > capacity:
+            length = capacity
+        return length, data
+
+    def _elem_summary(self, data, i: int) -> str:
+        try:
+            return value_summary(data[i])
+        except Exception:
+            return "<error>"
+
+    def to_string(self):
+        length, data = self._len_data()
+        if length is None:
+            return "<no value>"
+        if length == 0:
+            return "[0]{}"
+        return aggregate_value_summary("[%d]{" % length, "}",
+            get_value=lambda i: self._elem_summary(data, i),
+            length=length,
+        )
+
+    def children(self):
+        length, data = self._len_data()
+        if not length:
+            return iter(())
+        def gen():
+            try:
+                for i in range(length):
+                    yield ("[%d]" % i, data[i])
             except Exception:
                 return
         return gen()
@@ -842,6 +913,7 @@ def lookup_odin(val):
         Odin_Type.String:    Printer_String,
         Odin_Type.Slice:     Printer_Slice,
         Odin_Type.SOA_Slice: Printer_SOA_Slice,
+        Odin_Type.Fixed_Dynamic_Array: Printer_Fixed_Capacity_Dynamic_Array,
         Odin_Type.Array:     Printer_Array,
         Odin_Type.Struct:    Printer_Struct,
         Odin_Type.Enum:      Printer_Enum,
