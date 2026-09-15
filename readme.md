@@ -4,11 +4,6 @@ Python pretty-printers to visualize Odin slices, maps, arrays, etc. in GDB.
 
 Ported from [odin-lldb](https://github.com/thetarnav/odin-lldb) (original ideas by [harold-b](https://gist.github.com/harold-b/ef16a5c3ebcceccfc2bc7a5c5dd0058d) and [laytan](https://gist.github.com/laytan/a94c323a84cef7bcfbdf6d21987fd5a9)).
 
-## Requirements
-
-- Odin compiler (`odin build main.odin -file -debug -out:main.bin`)
-- Modern GDB (tested on GDB 12+; developed against GDB 17).
-
 ## Usage
 
 Manual load:
@@ -41,8 +36,9 @@ echo "source path/to/odin.py" >> "~/.gdbinit"
 ## Development
 
 ```bash
-./test.py            # build + run GDB test suite
-./debug_session.sh   # interactive GDB stopped at breakpoint()
+./test.py          # build + run GDB test suite
+./build.sh         # build main.odin with debug symbols
+./debug_session.sh # interactive GDB stopped at breakpoint()
 ```
 
 ## Resources
