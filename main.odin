@@ -2,7 +2,6 @@
 package main
 
 import "base:runtime"
-import "core:fmt"
 import "core:io"
 
 Enum     :: enum u8 {One, Two, Three}
