@@ -18,18 +18,18 @@ from collections.abc import Callable
 # Odin type dispatch
 
 class Odin_Type(enum.Enum):
-    Slice     = "slice"
-    Array     = "array"
-    String    = "string"
-    Map       = "map"
-    Struct    = "struct"
-    Ptr       = "pointer"
-    Enum      = "enum"
-    Bitset    = "bitset"
-    SOA_Slice = "soa_dynamic_array"
+    Slice               = "slice"
+    Array               = "array"
+    String              = "string"
+    Map                 = "map"
+    Struct              = "struct"
+    Ptr                 = "pointer"
+    Enum                = "enum"
+    Bitset              = "bitset"
+    SOA_Slice           = "soa_dynamic_array"
     Fixed_Dynamic_Array = "fixed_dynamic_array"
-    Other     = "other"
-    Union     = "union"
+    Other               = "other"
+    Union               = "union"
 
 def get_odin_type(t) -> Odin_Type:
 
@@ -910,17 +910,17 @@ def lookup_odin(val):
     except Exception:
         return None
     cls = {
-        Odin_Type.String:    Printer_String,
-        Odin_Type.Slice:     Printer_Slice,
-        Odin_Type.SOA_Slice: Printer_SOA_Slice,
+        Odin_Type.String:              Printer_String,
+        Odin_Type.Slice:               Printer_Slice,
+        Odin_Type.SOA_Slice:           Printer_SOA_Slice,
         Odin_Type.Fixed_Dynamic_Array: Printer_Fixed_Capacity_Dynamic_Array,
-        Odin_Type.Array:     Printer_Array,
-        Odin_Type.Struct:    Printer_Struct,
-        Odin_Type.Enum:      Printer_Enum,
-        Odin_Type.Bitset:    Printer_Bitset,
-        Odin_Type.Map:       Printer_Map,
-        Odin_Type.Union:     Printer_Union,
-        Odin_Type.Ptr:       Printer_Pointer,
+        Odin_Type.Array:               Printer_Array,
+        Odin_Type.Struct:              Printer_Struct,
+        Odin_Type.Enum:                Printer_Enum,
+        Odin_Type.Bitset:              Printer_Bitset,
+        Odin_Type.Map:                 Printer_Map,
+        Odin_Type.Union:               Printer_Union,
+        Odin_Type.Ptr:                 Printer_Pointer,
     }.get(kind)
     if cls is None:
         return None
