@@ -34,6 +34,10 @@ main :: proc () {
 	// (gdb) print str_empty
 	// ""
 
+	str_foo := "foo"
+	// (gdb) print str_foo
+	// "foo"
+
 	str_nil: string
 	// (gdb) print str_nil
 	// ""
