@@ -1,5 +1,3 @@
-# odin-gdb TODO (deferred from v1)
-
 - [ ] **Full SOA slice/dynamic-array children** — v1 ships summary-only
   (`SoaSlicePrinter` has empty `children()`). Blocked on Odin debug-info shape;
   see [odin-lang/Odin#5611](https://github.com/odin-lang/Odin/issues/5611).
