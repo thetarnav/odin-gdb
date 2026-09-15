@@ -16,10 +16,6 @@ from collections.abc import Callable
 
 # ------------------------------------------------------------------------------
 # Odin type dispatch
-#
-# Odin type names contain `[`, `]` and `#`, and GDB matches printers on
-# `type.strip_typedefs().tag`, so a custom lookup_odin() function with prefix
-# logic is more robust than RegexpCollectionPrettyPrinter.
 
 class Odin_Type(enum.Enum):
     Slice     = "slice"
@@ -84,9 +80,7 @@ def get_odin_type(t) -> Odin_Type:
     return Odin_Type.Other
 
 def value_summary(v, _depth: int = 0) -> str:
-    # Depth guard: LLDB's GetSummary() never recursed into nested pretty
-    # printers, but here to_string() helpers call each other. Cyclic data
-    # (e.g. linked structs) would otherwise hit RecursionError.
+    # Depth guard—prevent RecursionError.
     if _depth > 5:
         return "..."
     try:
@@ -98,7 +92,7 @@ def value_summary(v, _depth: int = 0) -> str:
             s = printer.to_string()
         except Exception as e:
             return f"<error: {e}>"
-        if isinstance(printer, StringPrinter):
+        if isinstance(printer, Printer_String):
             return '"%s"' % s.replace("\\", "\\\\").replace('"', '\\"')
         try:
             return str(s)
@@ -154,12 +148,10 @@ def get_data(v):
 #
 # Odin strings are UTF-8 encoded.
 #
-# NOTE: to_string() returns the RAW text (no quotes). GDB adds quoting and
-# escaping natively because display_hint() is "string". Composites that embed
-# strings (struct/map/slice summaries, odin-children) go through
-# value_summary(), which re-adds quotes.
+# NOTE: to_string() returns the RAW text (no quotes).
+# GDB adds quoting and escaping natively because display_hint() is "string".
 
-class StringPrinter:
+class Printer_String:
     def __init__(self, val) -> None:
         self.val = val
 
@@ -175,9 +167,6 @@ class StringPrinter:
         except gdb.error:
             return "<no value>"
         if data_addr == 0:
-            # Null data with nonzero len (e.g. transmute from a bare
-            # Raw_String). Render like the raw struct; hint falls back to
-            # None below so GDB prints this bare instead of quoting it.
             return "{nil, %d}" % length
         try:
             raw = bytes(gdb.selected_inferior().read_memory(data_addr, length))
@@ -217,12 +206,8 @@ class StringPrinter:
 #        cap:       int,
 #        allocator: ^runtime.Allocator,
 #    }
-#
-# NOTE: no chunking (odin-lldb's SLICE_CHUNK_SIZE trick is deleted).
-# GDB children() is a lazy generator, so flat `[i]` yields are fine and
-# `odin-children VAR MAX` bounds interactive inspection.
 
-class SlicePrinter:
+class Printer_Slice:
     def __init__(self, val) -> None:
         self.val = val
 
@@ -277,7 +262,7 @@ class SlicePrinter:
 
 
 # ------------------------------------------------------------------------------
-# SOA Slice / Dynamic Array (minimal v1: summary only)
+# SOA Slice / Dynamic Array
 #
 # Layout:
 #   struct {
@@ -289,10 +274,8 @@ class SlicePrinter:
 #       __$cap:    int,                     |      <no more fields>
 #       allocator: ^runtime.Allocator,      |
 #   }
-#
-# Full per-element children() is DEFERRED (see TODO.md, Odin issue #5611).
 
-class SoaSlicePrinter:
+class Printer_SOA_Slice:
     def __init__(self, val) -> None:
         self.val = val
 
@@ -333,7 +316,7 @@ class SoaSlicePrinter:
 # ------------------------------------------------------------------------------
 # Array Values
 
-class ArrayPrinter:
+class Printer_Array:
     def __init__(self, val) -> None:
         self.val = val
 
@@ -380,7 +363,7 @@ class ArrayPrinter:
 #
 # Default for any struct type that is not a built-in type.
 
-class StructPrinter:
+class Printer_Struct:
     def __init__(self, val) -> None:
         self.val = val
 
@@ -418,7 +401,7 @@ class StructPrinter:
 # ------------------------------------------------------------------------------
 # Enum Values
 
-class EnumPrinter:
+class Printer_Enum:
     def __init__(self, val) -> None:
         self.val = val
 
@@ -444,12 +427,8 @@ class EnumPrinter:
 
 # ------------------------------------------------------------------------------
 # Bit Set Values
-#
-# NOTE: the field named "tag" is skipped — it aliases the backing integer,
-# not a real flag. (odin-lldb iterated all children; its DWARF never exposed
-# a nonzero tag, but skipping is correct regardless of DWARF shape.)
 
-class BitsetPrinter:
+class Printer_Bitset:
     def __init__(self, val) -> None:
         self.val = val
 
@@ -482,13 +461,6 @@ class BitsetPrinter:
 
 # ------------------------------------------------------------------------------
 # Map Values
-#
-# Map children layout: alternating (key, value) pairs plus `len` / `cap`
-# trailer children (kept per project decision). Task 6.1 experiment result:
-# GDB 17.2 requires strict key/value alternation under display_hint("map") —
-# trailers leaked into rendering (`= {[0] = 0}` on empty maps, `[1] = 8` on
-# non-empty ones), so display_hint() returns None. Children still print
-# struct-style (`key0 = ..., ["k"] = ..., len = ..., cap = ...`).
 
 class Cell_Info:
     def __init__(self, size_of_type: int, size_of_cell: int, elements_per_cell: int) -> None:
@@ -497,9 +469,6 @@ class Cell_Info:
         self.elements_per_cell = elements_per_cell
 
 def cell_info(type_size: int, cell_size: int, cell_type) -> 'Cell_Info':
-    # Mirrors odin-lldb: elements-per-cell comes from the cell's FIRST CHILD
-    # type (e.g. value_cell struct{v:[2]Foo, _:[16]u8} holds 2 Foos), not from
-    # the cell struct itself (which is never an array).
     elements_per_cell = 1
 
     if type_size != cell_size:
@@ -541,35 +510,34 @@ def cell_index(base: int, info: "Cell_Info", index: int) -> int:
 
     return base + (cell_index * info.size_of_cell) + (data_index * info.size_of_type);
 
-class MapPrinter:
+class Printer_Map:
     def __init__(self, val) -> None:
         self.val = val
 
     def _decode(self) -> dict:
-        data = self.val["data"]
-        tagged = int(data)
-        cap_log2 = tagged & 63
-        cap = (1 << cap_log2) if cap_log2 > 0 else 0
-        key_ptr = tagged & ~63
-        # LLDB auto-dereferenced pointer children; GDB needs .dereference().
-        entries = data.dereference()
-        key_type = entries["key"].type
-        val_type = entries["value"].type
-        key_cell = entries["key_cell"]
-        value_cell = entries["value_cell"]
+        data          = self.val["data"]
+        tagged        = int(data)
+        cap_log2      = tagged & 63
+        cap           = (1 << cap_log2) if cap_log2 > 0 else 0
+        key_ptr       = tagged & ~63
+        entries       = data.dereference()
+        key_type      = entries["key"].type
+        val_type      = entries["value"].type
+        key_cell      = entries["key_cell"]
+        value_cell    = entries["value_cell"]
         key_cell_info = cell_info(key_type.sizeof, key_cell.type.sizeof, key_cell.type)
         val_cell_info = cell_info(val_type.sizeof, value_cell.type.sizeof, value_cell.type)
-        val_ptr = cell_index(key_ptr, key_cell_info, cap)
-        hash_ptr = cell_index(val_ptr, val_cell_info, cap)
+        val_ptr       = cell_index(key_ptr, key_cell_info, cap)
+        hash_ptr      = cell_index(val_ptr, val_cell_info, cap)
         return {
-            "length": int(self.val["len"]),
-            "cap": cap,
-            "key_ptr": key_ptr,
+            "length":   int(self.val["len"]),
+            "cap":      cap,
+            "key_ptr":  key_ptr,
             "key_type": key_type,
             "val_type": val_type,
             "key_info": key_cell_info,
             "val_info": val_cell_info,
-            "val_ptr": val_ptr,
+            "val_ptr":  val_ptr,
             "hash_ptr": hash_ptr,
         }
 
@@ -642,8 +610,6 @@ class MapPrinter:
         return gen()
 
     def display_hint(self):
-        # None (not "map"): GDB pairs children strictly under the map hint,
-        # so len/cap trailers corrupted rendering. See comment above.
         return None
 
 
@@ -681,7 +647,7 @@ def union_variant(v):
     except Exception:
         return None
 
-class UnionPrinter:
+class Printer_Union:
     def __init__(self, val) -> None:
         self.val = val
 
@@ -772,7 +738,7 @@ def type_display(t) -> str:
 # ------------------------------------------------------------------------------
 # Pointer Values
 
-class PointerPrinter:
+class Printer_Pointer:
     def __init__(self, val) -> None:
         self.val = val
 
@@ -791,8 +757,7 @@ class PointerPrinter:
         except Exception:
             return type_display(self.val.type)
 
-        # raw pointer (GDB 17 reports `void` with a code that does not equal
-        # gdb.TYPE_CODE_VOID, so match the name too)
+        # raw pointer
         try:
             void_name = str(target.strip_typedefs()) == "void"
         except Exception:
@@ -800,8 +765,7 @@ class PointerPrinter:
         if target.code == gdb.TYPE_CODE_VOID or void_name:
             return "rawptr(%s)" % hex(addr)
 
-        # proc pointer (param/return types straight from DWARF — verified:
-        # func_type.fields() gives params, func_type.target() gives return)
+        # proc pointer
         if target.code == gdb.TYPE_CODE_FUNC:
             return self._proc_display(target)
 
@@ -843,10 +807,10 @@ class PointerPrinter:
         return result
 
     def _soa_ptr_display(self, addr: int) -> str:
-        # Current Odin DWARF does not encode the element index: &soa[i] has
-        # the same value as &soa (points at an unadjusted struct copy), so the
-        # index is unknowable (see TODO.md / Odin#5611). Render honestly as a
-        # pointer to the whole SOA array instead of guessing an element.
+        # Current Odin DWARF does not encode the element index:
+        # &soa[i] has the same value as &soa (points at an unadjusted struct copy),
+        # so the index is unknowable (see TODO.md / Odin#5611).
+        # Render honestly as a pointer to the whole SOA array instead of guessing an element.
         try:
             v = self.val.dereference()
         except Exception:
@@ -866,8 +830,8 @@ class PointerPrinter:
 # ------------------------------------------------------------------------------
 # Lookup + registration
 #
-# GDB calls lookup_odin(val) for every value printed. Returning None falls
-# through to GDB defaults (today's `Other` type).
+# GDB calls lookup_odin(val) for every value printed.
+# Returning None falls through to GDB defaults—`Other` type.
 
 def lookup_odin(val):
     try:
@@ -875,16 +839,16 @@ def lookup_odin(val):
     except Exception:
         return None
     cls = {
-        Odin_Type.String:    StringPrinter,
-        Odin_Type.Slice:     SlicePrinter,
-        Odin_Type.SOA_Slice: SoaSlicePrinter,
-        Odin_Type.Array:     ArrayPrinter,
-        Odin_Type.Struct:    StructPrinter,
-        Odin_Type.Enum:      EnumPrinter,
-        Odin_Type.Bitset:    BitsetPrinter,
-        Odin_Type.Map:       MapPrinter,
-        Odin_Type.Union:     UnionPrinter,
-        Odin_Type.Ptr:       PointerPrinter,
+        Odin_Type.String:    Printer_String,
+        Odin_Type.Slice:     Printer_Slice,
+        Odin_Type.SOA_Slice: Printer_SOA_Slice,
+        Odin_Type.Array:     Printer_Array,
+        Odin_Type.Struct:    Printer_Struct,
+        Odin_Type.Enum:      Printer_Enum,
+        Odin_Type.Bitset:    Printer_Bitset,
+        Odin_Type.Map:       Printer_Map,
+        Odin_Type.Union:     Printer_Union,
+        Odin_Type.Ptr:       Printer_Pointer,
     }.get(kind)
     if cls is None:
         return None
@@ -911,10 +875,9 @@ if _odin_objfile is not None:
 # ------------------------------------------------------------------------------
 # odin-children command
 #
-# Replaces print_children.py from odin-lldb, folded into this file.
 # Usage: odin-children VARIABLE [MAX]
 
-class OdinPrintChildren(gdb.Command):
+class Odin_Children_Command(gdb.Command):
     """Print pretty-printer children of a variable, one per line."""
 
     def __init__(self) -> None:
@@ -988,6 +951,6 @@ def _default_children(val):
 
 
 try:
-    OdinPrintChildren()
+    Odin_Children_Command()
 except Exception:
     pass  # already registered (re-source safe)
