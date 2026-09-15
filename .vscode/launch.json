@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "cppdbg",
+            "request": "launch",
+            "name": "Run Odin Binary",
+            "program": "${workspaceFolder}/main.bin",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "build",
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Load Odin pretty-printers",
+                    "text": "source ${workspaceFolder}/odin.py"
+                }
+            ]
+        },
+        {
+            "type": "debugpy",
+            "request": "launch",
+            "name": "Run Test",
+            "program": "${workspaceFolder}/test.py",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        }
+    ]
+}
