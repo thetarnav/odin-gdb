@@ -165,8 +165,6 @@ def run_gdb(test_cases: List[TestCase]) -> str:
     timeout = 120
 
     try:
-        # Single run (odin-lldb accidentally ran the session twice here:
-        # subprocess.run followed by a second streaming Popen).
         result = subprocess.run(cmd,
                                 capture_output=True,
                                 text=True,
