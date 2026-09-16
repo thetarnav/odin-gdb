@@ -19,6 +19,12 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           release: latest
+      - name: Check GDB
+        run: |
+          which gdb || true
+          gdb --version || true
+          echo "PATH=$PATH"
+          ls -l /usr/bin/gdb 2>/dev/null || true
 
       - name: Run Tests
         run: ./test.py
