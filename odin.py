@@ -472,15 +472,71 @@ class Printer_Struct:
 # ------------------------------------------------------------------------------
 # Enum Values
 
+# Width (bytes) -> unsigned GDB type name for bit-preserving reads.
+_ENUM_UNSIGNED_BY_WIDTH = {1: "unsigned char", 2: "unsigned short", 4: "unsigned int", 8: "unsigned long long"}
+# Odin backing-type spellings that are unambiguous without parsing.
+_ENUM_SIGNED_NAMES = frozenset({"int", "i8", "i16", "i32", "i64"})
+_ENUM_UNSIGNED_NAMES = frozenset({"uint", "u8", "u16", "u32", "u64"})
+
+def _enum_backing_is_signed(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if n in _ENUM_SIGNED_NAMES:
+        return True
+    if n in _ENUM_UNSIGNED_NAMES:
+        return False
+    if "unsigned" in n:
+        return False
+    return True
+
+def _signed_enum_discriminant(val) -> int:
+    t = val.type.strip_typedefs()
+    backing = None
+    try:
+        backing = t.target()
+    except Exception:
+        backing = None
+    if backing is None:
+        try:
+            f0 = t.fields()[0]
+            if getattr(f0, "type", None) is not None:
+                backing = f0.type.strip_typedefs()
+        except Exception:
+            pass
+    if backing is not None:
+        try:
+            backing_name = str(backing.strip_typedefs())
+        except Exception:
+            backing_name = str(backing)
+        try:
+            width = int(backing.sizeof)
+        except Exception:
+            width = 8
+    else:
+        try:
+            backing_name = str(t)
+        except Exception:
+            backing_name = ""
+        width = 8
+    signed = _enum_backing_is_signed(backing_name)
+    unsigned_t = gdb.lookup_type(_ENUM_UNSIGNED_BY_WIDTH.get(width, "unsigned long long"))
+    raw = int(val.cast(unsigned_t))
+    bits = width * 8
+    if signed and raw >= (1 << (bits - 1)):
+        raw -= (1 << bits)
+    return raw
+
 class Printer_Enum:
     def __init__(self, val) -> None:
         self.val = val
 
     def to_string(self):
         try:
-            num = int(self.val)
+            num = _signed_enum_discriminant(self.val)
         except Exception:
-            return "<no value>"
+            try:
+                num = int(self.val)
+            except Exception:
+                return "<no value>"
         try:
             for f in self.val.type.strip_typedefs().fields():
                 if f.name and f.enumval is not None and f.enumval == num:
