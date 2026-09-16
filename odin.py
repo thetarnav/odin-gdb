@@ -830,6 +830,66 @@ def _proc_convention(typedef_name: str) -> str | None:
     raise ValueError("unparseable proc typedef name: %r" % (typedef_name,))
 
 
+def _split_top_level(s: str) -> list:
+    parts, depth, cur = [], 0, []
+    for ch in s:
+        if ch in "([{":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+def _clean_ret_elem(elem: str) -> str:
+    e = elem.strip()
+    tmp = e.replace("::", "\x00")
+    if ":" in tmp:
+        tmp = tmp.split(":", 1)[-1]
+    return tmp.replace("\x00", ".").strip().replace("::", ".")
+
+def _norm_type(s: str) -> str:
+    try:
+        return s.replace("::", ".").replace(" ", "").replace("\t", "")
+    except Exception:
+        return s
+
+def _proc_returns(typedef_name: str):
+    try:
+        s = typedef_name.strip()
+    except Exception:
+        return None
+    depth, arrow = 0, -1
+    i = 0
+    while i < len(s) - 1:
+        ch = s[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == "-" and s[i + 1] == ">" and depth == 0:
+            arrow = i
+            i += 1
+        i += 1
+    if arrow == -1:
+        return None
+    ret = s[arrow + 2:].strip()
+    if not ret:
+        return None
+    if ret.startswith("(") and ret.endswith(")"):
+        inner = ret[1:-1].strip()
+        if not inner:
+            return []
+        return [_clean_ret_elem(p) for p in _split_top_level(inner)]
+    return [_clean_ret_elem(ret)]
+
+
 # ------------------------------------------------------------------------------
 # Pointer Values
 
@@ -926,6 +986,40 @@ class Printer_Pointer:
                         params.pop()
             except Exception:
                 pass
+        # Multi-return reconstruction (types-only, per design).
+        # Tuple from typedef name; drop trailing sret slots on match, else fallback.
+        ret_tuple = None
+        if not legacy:
+            try:
+                ret_tuple = _proc_returns(typedef_name)
+            except Exception:
+                ret_tuple = None
+        tuple_suffix = None
+        if ret_tuple is not None and len(ret_tuple) >= 2:
+            try:
+                n_extra = len(ret_tuple) - 1
+                if n_extra <= len(params):
+                    cands = params[len(params) - n_extra:] if n_extra else []
+                    try:
+                        target_str = type_display(func_type.target())
+                    except Exception:
+                        target_str = ""
+                    ok = _norm_type(target_str) == _norm_type(ret_tuple[-1])
+                    if ok:
+                        for (slot_t, slot_disp), want in zip(cands, ret_tuple[:-1]):
+                            # Pointer-typed tuple elements are out of scope -> fallback.
+                            if want.lstrip().startswith("^") or want.lstrip().startswith("&"):
+                                ok = False
+                                break
+                            if _norm_type(slot_disp) != _norm_type(want):
+                                ok = False
+                                break
+                    if ok:
+                        if n_extra:
+                            del params[len(params) - n_extra:]
+                        tuple_suffix = " -> (" + ", ".join(ret_tuple) + ")"
+            except Exception:
+                tuple_suffix = None
         try:
             ret_str = type_display(func_type.target())
         except Exception:
@@ -935,7 +1029,12 @@ class Printer_Pointer:
         else:
             label = 'proc "%s"' % conv
         result = "%s (%s)" % (label, ", ".join(p for _, p in params))
-        if ret_str and ret_str != "void":
+        if tuple_suffix is not None:
+            result += tuple_suffix
+        elif ret_tuple is not None and len(ret_tuple) == 1:
+            # 1-tuple renders as single return, no parens (Odin style).
+            result += " -> " + ret_tuple[0]
+        elif ret_str and ret_str != "void":
             result += " -> " + ret_str
         return result
 

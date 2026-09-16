@@ -140,11 +140,15 @@ main :: proc () {
 
 	foo_proc_multi_res := proc (f: Foo, b: Bar) -> (idx: int, ok: bool) {return}
 	// (gdb) print foo_proc_multi_res
-	// proc (main.Foo, main.Bar, int) -> bool
+	// proc (main.Foo, main.Bar) -> (int, bool)
 
 	foo_bar_contextless := proc "contextless" (f: Foo, b: Bar) -> (idx: int, ok: bool) {return}
 	// (gdb) print foo_bar_contextless
-	// proc "contextless" (main.Foo, main.Bar, int) -> bool
+	// proc "contextless" (main.Foo, main.Bar) -> (int, bool)
+
+	foo_proc_tri_res := proc (f: Foo, b: Bar) -> (idx: int, n: f32, ok: bool) {return}
+	// (gdb) print foo_proc_tri_res
+	// proc (main.Foo, main.Bar) -> (int, f32, bool)
 
 	foo_proc_c := proc "c" (f: ^Foo, b: Bar) {return}
 	// (gdb) print foo_proc_c
