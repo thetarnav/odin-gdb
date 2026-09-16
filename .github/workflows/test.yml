@@ -13,17 +13,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           release: latest
-
-      - name: Check GDB
-        run: |
-          gdb --version
-          python3 -c "import sys; print(sys.version)"
 
       - name: Run Tests
         run: ./test.py
