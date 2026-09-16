@@ -806,6 +806,30 @@ def type_display(t) -> str:
     return name
 
 
+def _proc_convention(typedef_name: str) -> str | None:
+    """Parse the calling convention from an unstripped proc typedef name.
+
+    Returns None for bare `proc(` (odin default), else the quoted label
+    (canonical `cdecl` mapped to `c`). Raises ValueError when unparseable
+    so the caller can fall back to legacy output.
+    """
+    try:
+        s = typedef_name.strip()
+    except Exception:
+        raise ValueError("unparseable proc typedef name")
+    if s.startswith("proc("):
+        return None
+    if s.startswith('proc"'):
+        end = s.find('"', len('proc"'))
+        if end != -1 and s[end + 1:].lstrip().startswith("("):
+            label = s[len('proc"'):end]
+            if label == "cdecl":
+                return "c"
+            if label:
+                return label
+    raise ValueError("unparseable proc typedef name: %r" % (typedef_name,))
+
+
 # ------------------------------------------------------------------------------
 # Pointer Values
 
@@ -838,7 +862,11 @@ class Printer_Pointer:
 
         # proc pointer
         if target.code == gdb.TYPE_CODE_FUNC:
-            return self._proc_display(target)
+            try:
+                typedef_name = str(self.val.type)
+            except Exception:
+                typedef_name = ""
+            return self._proc_display(target, typedef_name)
 
         # SOA slice pointer (e.g. &soa_slice[1])
         try:
@@ -858,21 +886,55 @@ class Printer_Pointer:
         except Exception:
             return type_display(self.val.type)
 
-    def _proc_display(self, func_type) -> str:
+    def _proc_display(self, func_type, typedef_name: str = "") -> str:
+        try:
+            conv = _proc_convention(typedef_name)
+        except Exception:
+            conv = "c"
+            legacy = True
+        else:
+            legacy = False
         params = []
         try:
-            for f in func_type.fields():
+            fields = func_type.fields()
+        except Exception:
+            fields = []
+        try:
+            for f in fields:
                 try:
-                    params.append(type_display(f.type))
+                    params.append((f.type, type_display(f.type)))
                 except Exception:
                     continue
         except Exception:
             pass
+        # v1 un-lowering: hide implicit trailing ^Context for odin default.
+        if not legacy and conv is None and params:
+            try:
+                last_t = params[-1][0].strip_typedefs()
+                if last_t.code == gdb.TYPE_CODE_PTR:
+                    try:
+                        pointee = last_t.target()
+                    except Exception:
+                        pointee = None
+                    tag = ""
+                    if pointee is not None:
+                        try:
+                            tag = pointee.tag or str(pointee)
+                        except Exception:
+                            tag = ""
+                    if "Context" in tag:
+                        params.pop()
+            except Exception:
+                pass
         try:
             ret_str = type_display(func_type.target())
         except Exception:
             ret_str = ""
-        result = 'proc "c" (%s)' % ", ".join(params)
+        if legacy or conv is None:
+            label = "proc" if (conv is None and not legacy) else 'proc "c"'
+        else:
+            label = 'proc "%s"' % conv
+        result = "%s (%s)" % (label, ", ".join(p for _, p in params))
         if ret_str and ret_str != "void":
             result += " -> " + ret_str
         return result

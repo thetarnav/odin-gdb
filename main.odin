@@ -132,19 +132,48 @@ main :: proc () {
 
 	foo_proc := proc (f: ^Foo, b: Bar) {return}
 	// (gdb) print foo_proc
-	// proc "c" (^main.Foo, main.Bar, ^runtime.Context)
+	// proc (^main.Foo, main.Bar)
 
 	foo_proc_ok := proc (f: ^Foo, b: Bar) -> (ok: bool) {return}
 	// (gdb) print foo_proc_ok
-	// proc "c" (^main.Foo, main.Bar, ^runtime.Context) -> bool
+	// proc (^main.Foo, main.Bar) -> bool
 
 	foo_proc_multi_res := proc (f: Foo, b: Bar) -> (idx: int, ok: bool) {return}
 	// (gdb) print foo_proc_multi_res
-	// proc "c" (main.Foo, main.Bar, int, ^runtime.Context) -> bool
+	// proc (main.Foo, main.Bar, int) -> bool
 
 	foo_bar_contextless := proc "contextless" (f: Foo, b: Bar) -> (idx: int, ok: bool) {return}
 	// (gdb) print foo_bar_contextless
-	// proc "c" (main.Foo, main.Bar, int) -> bool
+	// proc "contextless" (main.Foo, main.Bar, int) -> bool
+
+	foo_proc_c := proc "c" (f: ^Foo, b: Bar) {return}
+	// (gdb) print foo_proc_c
+	// proc "c" (^main.Foo, main.Bar)
+
+	foo_proc_noargs := proc () {return}
+	// (gdb) print foo_proc_noargs
+	// proc ()
+
+	foo_proc_ctxless_noargs := proc "contextless" () {return}
+	// (gdb) print foo_proc_ctxless_noargs
+	// proc "contextless" ()
+
+	foo_proc_nil: proc (f: ^Foo, b: Bar) = nil
+	// (gdb) print foo_proc_nil
+	// nil
+
+	foo_proc_c_nil: proc "c" (f: ^Foo, b: Bar) = nil
+	// (gdb) print foo_proc_c_nil
+	// nil
+
+	foo_proc_ctxless_nil: proc "contextless" (f: Foo, b: Bar) -> (idx: int, ok: bool) = nil
+	// (gdb) print foo_proc_ctxless_nil
+	// nil
+
+	Holder :: struct {cb: proc (f: ^Foo) -> bool}
+	holder := Holder{cb = proc (f: ^Foo) -> bool {return true}}
+	// (gdb) print holder.cb
+	// proc (^main.Foo) -> bool
 
 	slice := []Foo{{"Slice1", 1}, {"Slice2", 2}}
 	// (gdb) print slice
