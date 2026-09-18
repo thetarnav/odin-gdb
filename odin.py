@@ -966,11 +966,14 @@ class ProcSignature:
     # Hidden params in C-ABI order: list of (kind, type_str),
     # kind in ("sret", "ctx").
     hidden_params: list
+    # Indexes into written_params passed indirectly via hidden pointer.
+    # hidden_params holds ("byref", type_str) entries in the same order.
+    byref_indexes: tuple = ()
     # None = void | ("single", type_str) | ("tuple", [type_strs]) |
     # ("lowered", type_str) = sret cross-check failed, render lowered form.
-    returns: object
+    returns: object = None
     # Source typedef string, for debugging only (never re-parsed).
-    typedef_name: str
+    typedef_name: str = ""
 
 
 @dataclasses.dataclass
@@ -978,6 +981,12 @@ class CCall:
     expr_string: str
     temp_allocs: list
     cleanup: list
+
+
+# Hidden-pointer synthesis threshold (amd64 SysV MEMORY class).
+# Aggregates (struct/array/union) with sizeof > 16 are passed indirectly.
+BYREF_SIZE_THRESHOLD = 16
+BYREF_ALIGN_THRESHOLD = 16
 
 
 class ProcCallError(Exception):
@@ -1003,8 +1012,90 @@ def _strip_hidden_context(convention, params: list) -> tuple:
     return written, hidden
 
 
+def _aggregate_sizeof(display_type: str, sizeof_probe=None):
+    """Return sizeof for a display type string, or None when unknown.
+
+    Only aggregate (struct/array/union) types return a size; pointers,
+    references, and unresolvable names return None (native path).
+    sizeof_probe defaults to gdb.lookup_type and takes a "::" type name.
+    """
+    s = (display_type or "").strip()
+    if not s or s.startswith("^") or s.startswith("&"):
+        return None
+    probe = sizeof_probe
+    if probe is None:
+        try:
+            probe = gdb.lookup_type
+        except Exception:
+            return None
+    try:
+        agg_codes = (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_ARRAY,
+                     gdb.TYPE_CODE_UNION)
+    except Exception:
+        return None
+    base = [s.replace(".", "::"), s]
+    candidates = base + ["struct " + b for b in base]
+    for cand in candidates:
+        try:
+            t = probe(cand)
+        except Exception:
+            continue
+        if t is None:
+            continue
+        try:
+            code = t.strip_typedefs().code
+        except Exception:
+            continue
+        if code not in agg_codes:
+            return None
+        try:
+            return int(t.sizeof)
+        except Exception:
+            return None
+    return None
+
+
+def _classify_byref(written, sizeof_probe=None):
+    entries = []
+    indexes = []
+    for i, disp in enumerate(written or ()):
+        if _norm_type(disp).startswith('^') or _norm_type(disp).startswith('&'):
+            continue
+        try:
+            size = _aggregate_sizeof(disp, sizeof_probe)
+        except Exception:
+            size = None
+        if size is not None and size > BYREF_SIZE_THRESHOLD:
+            entries.append(('byref', disp))
+            indexes.append(i)
+    return entries, tuple(indexes)
+
+
+_C_RET_SCALARS = {
+    'i8': 'char', 'i16': 'short', 'i32': 'int', 'i64': 'long',
+    'u8': 'unsigned char', 'u16': 'unsigned short',
+    'u32': 'unsigned int', 'u64': 'unsigned long',
+    'f32': 'float', 'f64': 'double',
+    'int': 'long', 'uint': 'unsigned long',
+    'bool': 'int', 'byte': 'unsigned char', 'rune': 'int',
+    'rawptr': 'void*', 'void': 'void',
+}
+
+def _c_ret_spelling(disp):
+    if disp is None:
+        return 'void'
+    n = _norm_type(disp or '')
+    if n == '':
+        return 'void'
+    if n in _C_RET_SCALARS:
+        return _C_RET_SCALARS[n]
+    if n.startswith('^') or n.startswith('&'):
+        return 'void*'
+    return None
+
+
 def parse_proc_signature(typedef_name: str, lowered_params: list,
-                         lowered_ret: str):
+                         lowered_ret: str, sizeof_probe=None):
     """The single place proc typedef parsing + ctx-strip + sret lives.
 
     Returns a ProcSignature, or None when the convention is unparseable
@@ -1064,12 +1155,16 @@ def parse_proc_signature(typedef_name: str, lowered_params: list,
     else:
         returns = None
 
+    byref_entries, byref_indexes = _classify_byref(written, sizeof_probe)
+    hidden.extend(byref_entries)
+
     return ProcSignature(
         convention=conv,
         written_params=written,
         hidden_params=hidden,
         returns=returns,
         typedef_name=typedef_name,
+        byref_indexes=byref_indexes,
     )
 
 
@@ -1099,8 +1194,41 @@ def _proc_legacy_display(lowered_params: list, lowered_ret: str) -> str:
     return result
 
 
+class _DefaultMemOps:
+    """Real inferior memory ops. Methods raise on failure; alloc returns 0 on null."""
+
+    def sizeof(self, display_type: str):
+        return _aggregate_sizeof(display_type)
+
+    def alignof(self, display_type: str):
+        s = (display_type or "").strip().replace(".", "::")
+        for cand in (s, "struct " + s):
+            try:
+                return int(gdb.lookup_type(cand).strip_typedefs().alignof)
+            except Exception:
+                continue
+        return 0
+
+    def read_bytes(self, arg_expr: str, size: int) -> bytes:
+        addr = int(gdb.parse_and_eval("(long)&(%s)" % arg_expr))
+        return bytes(gdb.selected_inferior().read_memory(addr, size))
+
+    def alloc(self, size: int, align: int) -> int:
+        if align and align > BYREF_ALIGN_THRESHOLD:
+            rnd = ((size + align - 1) // align) * align
+            return int(gdb.parse_and_eval(
+                "(long)aligned_alloc(%d, %d)" % (align, rnd)))
+        return int(gdb.parse_and_eval("(long)malloc(%d)" % size))
+
+    def write(self, addr: int, buf: bytes) -> None:
+        gdb.selected_inferior().write_memory(addr, buf)
+
+    def free(self, addr: int) -> None:
+        gdb.parse_and_eval("(void)free((void*)%d)" % addr)
+
+
 def call_plan(sig: ProcSignature, fn_expr: str, fn_addr: int,
-              user_args: list) -> CCall:
+              user_args: list, mem_ops=None, force=None) -> CCall:
     """Build the C call expression from a signature. Never parses strings.
 
     fn_expr names the callee verbatim in the expression; fn_addr is only
@@ -1138,10 +1266,90 @@ def call_plan(sig: ProcSignature, fn_expr: str, fn_addr: int,
                 "error: proc '%s' has %d hidden sret slot(s) (%s); "
                 "pass slot addresses as trailing args" % (fn_expr, sret_count, slots))
         args = list(user_args)
+    ops = mem_ops if mem_ops is not None else _DefaultMemOps()
+    byref_idx = list(getattr(sig, "byref_indexes", ()) or ())
+    if force == "byval":
+        byref_idx = []
+    elif force == "byref":
+        byref_idx = []
+        for i, disp in enumerate(sig.written_params):
+            n = _norm_type(disp)
+            if n.startswith("^") or n.startswith("&"):
+                continue
+            try:
+                size = ops.sizeof(disp)
+            except Exception:
+                size = None
+            if size is not None and size > 0:
+                byref_idx.append(i)
+    elif force is not None:
+        raise ProcCallError("error: unknown force mode %r" % (force,))
+    staged = {}
+    allocs = []
+    for i in byref_idx:
+        disp = sig.written_params[i]
+        try:
+            size = ops.sizeof(disp)
+        except Exception:
+            size = None
+        if size is None or size <= 0:
+            raise ProcCallError(
+                "error: cannot stage by-ref arg %d (%s): unknown sizeof; "
+                "retry with --byval" % (i, disp))
+        arg = args[i]
+        if arg.lstrip().startswith("&"):
+            raise ProcCallError(
+                "error: arg %d is '%s' but '%s' takes %s by value; "
+                "drop the & (staging is automatic)" % (i, arg, fn_expr, disp))
+        try:
+            buf = ops.read_bytes(arg, size)
+        except Exception as e:
+            raise ProcCallError(
+                "error: cannot read by-ref arg %d (%s): %s" % (i, arg, e))
+        try:
+            align = ops.alignof(disp)
+        except Exception:
+            align = 0
+        try:
+            addr = ops.alloc(size, align)
+        except Exception as e:
+            raise ProcCallError("error: inferior alloc failed: %s" % e)
+        if not addr:
+            raise ProcCallError(
+                "error: inferior malloc(%d) returned nil, refusing to call"
+                % size)
+        try:
+            ops.write(addr, buf)
+        except Exception as e:
+            try:
+                ops.free(addr)
+            except Exception:
+                pass
+            raise ProcCallError(
+                "error: cannot stage by-ref arg %d: %s" % (i, e))
+        allocs.append(addr)
+        staged[i] = "(void*)%d" % addr
+    if staged:
+        args = [staged.get(i, a) for i, a in enumerate(args)]
     if has_ctx:
         args.append("&context")
-    return CCall(expr_string="%s(%s)" % (fn_expr, ", ".join(args)),
-                 temp_allocs=[], cleanup=[])
+    if staged:
+        if sig.returns is None:
+            rc = 'void'
+        elif sig.returns[0] == 'single':
+            rc = _c_ret_spelling(sig.returns[1])
+        else:
+            rc = None
+        if rc is None:
+            raise ProcCallError("error: cannot stage by-ref call of '%s': unsupported %s return; retry with --byval" % (fn_expr, sig.returns,))
+        callee = '((%s (*)())%s)' % (rc, fn_expr)
+    else:
+        callee = fn_expr
+    cleanups = []
+    for addr in allocs:
+        cleanups.append(lambda addr=addr: ops.free(addr))
+    return CCall(expr_string='%s(%s)' % (callee, ', '.join(args)),
+                 temp_allocs=list(allocs), cleanup=cleanups)
 
 
 # ------------------------------------------------------------------------------
@@ -1377,6 +1585,8 @@ except Exception:
 #   odin-call add_ints(2, 3)
 #   odin-call foo_value(foo)
 #   odin-call 'main::add_ints'(2, 3)   (imported proc: quote the :: name)
+#   odin-call --byval foo_value(foo)   (force native by-value path)
+#   odin-call --byref pair_sum(pair)   (force hidden-pointer staging)
 #
 # Stopped-inferior only; pure procs preferred. Single-return and void
 # procs are fully automatic (hidden &context appended). Multi-return
@@ -1393,9 +1603,14 @@ class Odin_Call_Command(gdb.Command):
 
     def invoke(self, arg, from_tty) -> None:
         text = (arg or "").strip()
+        force = None
+        mflag = _re.match(r"^(--byval|--byref)\s+(.*)$", text, _re.S)
+        if mflag:
+            force = mflag.group(1)[2:]
+            text = mflag.group(2).strip()
         m = _re.match(r"^([^\s(]+)\s*\((.*)\)\s*$", text, _re.S)
         if not m:
-            print("Usage: odin-call PROC_NAME(ARG, ...)  e.g. odin-call add_ints(2, 3)")
+            print("Usage: odin-call [--byval|--byref] PROC_NAME(ARG, ...)  e.g. odin-call add_ints(2, 3)")
             return
         fn_token, argstr = m.group(1), m.group(2).strip()
         user_args = (_split_top_level(argstr) if argstr else [])
@@ -1534,13 +1749,15 @@ class Odin_Call_Command(gdb.Command):
                 returns = None
             else:
                 returns = ("single", lowered_ret)
+            byref_entries, byref_indexes = _classify_byref(written)
             sig = ProcSignature(convention="c", written_params=written,
-                                hidden_params=[], returns=returns,
-                                typedef_name=typedef_name)
+                                hidden_params=list(byref_entries), returns=returns,
+                                typedef_name=typedef_name,
+                                byref_indexes=byref_indexes)
 
         # --- plan (nil / arity / lowered refusals are deterministic) ---
         try:
-            plan = call_plan(sig, resolved_expr, fn_addr, user_args)
+            plan = call_plan(sig, resolved_expr, fn_addr, user_args, force=force)
         except ProcCallError as e:
             print(e)
             return

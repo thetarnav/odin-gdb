@@ -19,8 +19,7 @@ Foo_Bar_Union            :: union {Foo, Bar, string}
 Foo_Bar_Union_No_Nill    :: union #no_nil {Foo, Bar}
 Foo_Bar_Union_Shared_Nil :: union #shared_nil {Enum, ^Foo, ^Bar}
 
-// Pure package-level procs used as odin-call fixtures (no globals touched).
-// NOTE: by-value struct args (>16B) can't be called via GDB's C ABI (Odin passes hidden pointer), so fixtures take pointers.
+Pair :: struct {a, b: int} // 16B — native by-value control case
 
 add_ints :: proc (a, b: int) -> int {
 	return a + b
@@ -28,8 +27,14 @@ add_ints :: proc (a, b: int) -> int {
 dup_foo :: proc (f: ^Foo) -> Foo {
 	return f^
 }
-foo_value :: proc (f: ^Foo) -> int {
+foo_value :: proc (f: Foo) -> int {
 	return f.value
+}
+long_value :: proc (l: Struct_Long) -> int {
+	return l.a
+}
+pair_sum :: proc (p: Pair) -> int {
+	return p.a + p.b
 }
 is_big_bar :: proc (b: ^Bar) -> bool {
 	return b.value > 100
@@ -95,6 +100,10 @@ main :: proc () {
 	bar := Bar{84, "World"}
 	// (gdb) print bar
 	// {84, "World"} = {value = 84, bar_name = "World"}
+
+	pair := Pair{3, 4}
+	// (gdb) print pair
+	// {3, 4} = {a = 3, b = 4}
 
 	enum_two := Enum.Two
 	// (gdb) print enum_two
@@ -336,6 +345,8 @@ main :: proc () {
 	_ = add_ints
 	_ = dup_foo
 	_ = foo_value
+	_ = long_value
+	_ = pair_sum
 	_ = is_big_bar
 	_ = get_magic
 	_ = add_ints_contextless
@@ -357,8 +368,14 @@ main :: proc () {
 	// (gdb) odin-call is_big_bar(&bar)
 	// false
 
-	// (gdb) odin-call foo_value(&foo)
+	// (gdb) odin-call foo_value(foo)
 	// 42
+
+	// (gdb) odin-call long_value(struct_long)
+	// 100000001
+
+	// (gdb) odin-call pair_sum(pair)
+	// 7
 
 	// (gdb) odin-call dup_foo(&foo)
 	// {"Hello", 42} = {foo_name = "Hello", value = 42}

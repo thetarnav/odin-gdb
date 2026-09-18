@@ -45,24 +45,6 @@ echo "source path/to/odin.py" >> "~/.gdbinit"
 $1 = 5
 ```
 
-Rules:
-
-- Inferior must be stopped (e.g. at `breakpoint()`); pure procs preferred —
-  calling a proc with side effects mutates program state.
-- Hidden args are handled: `&context` is appended automatically for
-  `odin`-default procs (`contextless`/`"c"` procs take none).
-- Multi-return procs need explicit sret slot addresses as trailing args
-  (automatic slot allocation is planned).
-- GDB must be allowed to call: `set may-call-functions on` (default on);
-  a breakpoint hit inside the callee or a stopped thread aborts the call —
-  locking is restored, temps may leak on that failure path only.
-- Dummy-frame notes: results live in `$N` history like `print`; `ptype`
-  shows the lowered signature when the sugared call is refused.
-- Package-level procs resolve by bare name with automatic `main::`-style
-  discovery — quote only if ambiguous: `'pkg::proc'`.
-- LIMIT: by-value struct args over 16 bytes may misdeliver (hidden-pointer
-  codegen vs by-value DWARF) — pass pointers (`&foo`) instead.
-
 ## Development
 
 ```bash
