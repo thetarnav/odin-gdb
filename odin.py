@@ -10,6 +10,7 @@ Repository: https://github.com/thetarnav/odin-gdb
 """
 
 import gdb
+import dataclasses
 import enum
 from collections.abc import Callable
 
@@ -947,6 +948,203 @@ def _proc_returns(typedef_name: str):
 
 
 # ------------------------------------------------------------------------------
+# Pure proc core (no GDB I/O)
+#
+# Single model for procedure signatures. Both the display path
+# (format_proc) and the eval path (call_plan) consume ProcSignature;
+# neither parses typedef strings itself.
+
+import dataclasses
+
+
+@dataclasses.dataclass
+class ProcSignature:
+    # None = odin default convention, else label string ("c", "contextless", ...)
+    convention: object
+    # Written (user-visible) params as display type strings.
+    written_params: list
+    # Hidden params in C-ABI order: list of (kind, type_str),
+    # kind in ("sret", "ctx").
+    hidden_params: list
+    # None = void | ("single", type_str) | ("tuple", [type_strs]) |
+    # ("lowered", type_str) = sret cross-check failed, render lowered form.
+    returns: object
+    # Source typedef string, for debugging only (never re-parsed).
+    typedef_name: str
+
+
+@dataclasses.dataclass
+class CCall:
+    expr_string: str
+    temp_allocs: list
+    cleanup: list
+
+
+class ProcCallError(Exception):
+    pass
+
+
+def _strip_hidden_context(convention, params: list) -> tuple:
+    """Pop trailing ^Context for the odin default convention.
+
+    Mirrors the historical printer rule on display strings: the last
+    param whose normalized form is pointer-typed and mentions "Context".
+    Returns (written, hidden) without mutating the input.
+    """
+    written = list(params)
+    hidden = []
+    if convention is None and written:
+        try:
+            n = _norm_type(written[-1])
+        except Exception:
+            n = ""
+        if n.startswith("^") and "Context" in n:
+            hidden.append(("ctx", written.pop()))
+    return written, hidden
+
+
+def parse_proc_signature(typedef_name: str, lowered_params: list,
+                         lowered_ret: str):
+    """The single place proc typedef parsing + ctx-strip + sret lives.
+
+    Returns a ProcSignature, or None when the convention is unparseable
+    (caller falls back to the legacy lowered display / refuses the call).
+    """
+    try:
+        conv = _proc_convention(typedef_name)
+    except Exception:
+        return None
+    try:
+        ret_tuple = _proc_returns(typedef_name)
+    except Exception:
+        return None
+
+    written, hidden = _strip_hidden_context(conv, list(lowered_params))
+    returns = None
+
+    if ret_tuple is not None and len(ret_tuple) >= 2:
+        n_extra = len(ret_tuple) - 1
+        if n_extra > len(written):
+            return None
+        cands = written[len(written) - n_extra:] if n_extra else []
+        try:
+            target_norm = _norm_type(lowered_ret)
+        except Exception:
+            target_norm = lowered_ret
+        ok = target_norm == _norm_type(ret_tuple[-1])
+        if ok:
+            for slot_disp, want in zip(cands, ret_tuple[:-1]):
+                wl = want.lstrip()
+                if wl.startswith("^") or wl.startswith("&"):
+                    ok = False
+                    break
+                if _norm_type(slot_disp) != _norm_type(want):
+                    ok = False
+                    break
+        if not ok:
+            # Cross-check failed: keep slots visible, render lowered
+            # return. call_plan refuses to build a sugared call for this.
+            return ProcSignature(
+                convention=conv,
+                written_params=written,
+                hidden_params=hidden,
+                returns=("lowered", lowered_ret),
+                typedef_name=typedef_name,
+            )
+        for s in cands:
+            hidden.append(("sret", s))
+        if n_extra:
+            del written[len(written) - n_extra:]
+        returns = ("tuple", list(ret_tuple))
+    elif ret_tuple is not None and len(ret_tuple) == 1:
+        # 1-tuple renders as single return, no parens (Odin style).
+        returns = ("single", ret_tuple[0])
+    elif lowered_ret and lowered_ret != "void":
+        returns = ("single", lowered_ret)
+    else:
+        returns = None
+
+    return ProcSignature(
+        convention=conv,
+        written_params=written,
+        hidden_params=hidden,
+        returns=returns,
+        typedef_name=typedef_name,
+    )
+
+
+def format_proc(sig: ProcSignature) -> str:
+    """Render `proc [...] (...) [-> ...]` from a signature (types only)."""
+    if sig.convention is None:
+        label = "proc"
+    else:
+        label = 'proc "%s"' % sig.convention
+    result = "%s (%s)" % (label, ", ".join(sig.written_params))
+    if sig.returns is None:
+        return result
+    kind, payload = sig.returns
+    if kind == "tuple":
+        result += " -> (" + ", ".join(payload) + ")"
+    else:
+        # "single" and "lowered" both render bare.
+        result += " -> " + payload
+    return result
+
+
+def _proc_legacy_display(lowered_params: list, lowered_ret: str) -> str:
+    """Byte-identical fallback for convention-unparseable typedefs."""
+    result = 'proc "c" (%s)' % ", ".join(lowered_params)
+    if lowered_ret and lowered_ret != "void":
+        result += " -> " + lowered_ret
+    return result
+
+
+def call_plan(sig: ProcSignature, fn_expr: str, fn_addr: int,
+              user_args: list) -> CCall:
+    """Build the C call expression from a signature. Never parses strings.
+
+    fn_expr names the callee verbatim in the expression; fn_addr is only
+    used for the nil refusal. Hidden ^Context is auto-appended as
+    `&context`; hidden sret slots must be supplied by the caller as
+    trailing args (Phase 1 explicit; Phase 2 automates allocation).
+    """
+    if not fn_addr:
+        raise ProcCallError("error: proc is nil, refusing to call")
+    if sig.returns is not None and sig.returns[0] == "lowered":
+        raise ProcCallError(
+            "error: cannot build sugared call for '%s' "
+            "(signature mismatch); inspect with ptype and call the "
+            "lowered form" % fn_expr)
+    sret_count = sum(1 for k, _ in sig.hidden_params if k == "sret")
+    has_ctx = any(k == "ctx" for k, _ in sig.hidden_params)
+    n_written = len(sig.written_params)
+    if sret_count and len(user_args) == n_written + sret_count:
+        # Caller supplied sret slot addresses explicitly.
+        args = list(user_args)
+    elif len(user_args) != n_written:
+        msg = ["error: arity mismatch for '%s': proc takes %d%s, got %d"
+               % (fn_expr, n_written,
+                  " (+ %d sret slot(s))" % sret_count if sret_count else "",
+                  len(user_args))]
+        if sret_count:
+            slots = ", ".join(t for k, t in sig.hidden_params if k == "sret")
+            msg.append("hidden sret slot(s): %s "
+                       "(pass slot addresses as trailing args)" % slots)
+        raise ProcCallError(" ".join(msg))
+    else:
+        if sret_count:
+            slots = ", ".join(t for k, t in sig.hidden_params if k == "sret")
+            raise ProcCallError(
+                "error: proc '%s' has %d hidden sret slot(s) (%s); "
+                "pass slot addresses as trailing args" % (fn_expr, sret_count, slots))
+        args = list(user_args)
+    if has_ctx:
+        args.append("&context")
+    return CCall(expr_string="%s(%s)" % (fn_expr, ", ".join(args)),
+                 temp_allocs=[], cleanup=[])
+
+
+# ------------------------------------------------------------------------------
 # Pointer Values
 
 class Printer_Pointer:
@@ -1003,96 +1201,23 @@ class Printer_Pointer:
             return type_display(self.val.type)
 
     def _proc_display(self, func_type, typedef_name: str = "") -> str:
+        lowered_params = []
         try:
-            conv = _proc_convention(typedef_name)
-        except Exception:
-            conv = "c"
-            legacy = True
-        else:
-            legacy = False
-        params = []
-        try:
-            fields = func_type.fields()
-        except Exception:
-            fields = []
-        try:
-            for f in fields:
+            for f in func_type.fields():
                 try:
-                    params.append((f.type, type_display(f.type)))
+                    lowered_params.append(type_display(f.type))
                 except Exception:
                     continue
         except Exception:
             pass
-        # v1 un-lowering: hide implicit trailing ^Context for odin default.
-        if not legacy and conv is None and params:
-            try:
-                last_t = params[-1][0].strip_typedefs()
-                if last_t.code == gdb.TYPE_CODE_PTR:
-                    try:
-                        pointee = last_t.target()
-                    except Exception:
-                        pointee = None
-                    tag = ""
-                    if pointee is not None:
-                        try:
-                            tag = pointee.tag or str(pointee)
-                        except Exception:
-                            tag = ""
-                    if "Context" in tag:
-                        params.pop()
-            except Exception:
-                pass
-        # Multi-return reconstruction (types-only, per design).
-        # Tuple from typedef name; drop trailing sret slots on match, else fallback.
-        ret_tuple = None
-        if not legacy:
-            try:
-                ret_tuple = _proc_returns(typedef_name)
-            except Exception:
-                ret_tuple = None
-        tuple_suffix = None
-        if ret_tuple is not None and len(ret_tuple) >= 2:
-            try:
-                n_extra = len(ret_tuple) - 1
-                if n_extra <= len(params):
-                    cands = params[len(params) - n_extra:] if n_extra else []
-                    try:
-                        target_str = type_display(func_type.target())
-                    except Exception:
-                        target_str = ""
-                    ok = _norm_type(target_str) == _norm_type(ret_tuple[-1])
-                    if ok:
-                        for (slot_t, slot_disp), want in zip(cands, ret_tuple[:-1]):
-                            # Pointer-typed tuple elements are out of scope -> fallback.
-                            if want.lstrip().startswith("^") or want.lstrip().startswith("&"):
-                                ok = False
-                                break
-                            if _norm_type(slot_disp) != _norm_type(want):
-                                ok = False
-                                break
-                    if ok:
-                        if n_extra:
-                            del params[len(params) - n_extra:]
-                        tuple_suffix = " -> (" + ", ".join(ret_tuple) + ")"
-            except Exception:
-                tuple_suffix = None
         try:
-            ret_str = type_display(func_type.target())
+            lowered_ret = type_display(func_type.target())
         except Exception:
-            ret_str = ""
-        if legacy or conv is None:
-            label = "proc" if (conv is None and not legacy) else 'proc "c"'
-        else:
-            label = 'proc "%s"' % conv
-        result = "%s (%s)" % (label, ", ".join(p for _, p in params))
-        if tuple_suffix is not None:
-            result += tuple_suffix
-        elif ret_tuple is not None and len(ret_tuple) == 1:
-            # 1-tuple renders as single return, no parens (Odin style).
-            result += " -> " + ret_tuple[0]
-        elif ret_str and ret_str != "void":
-            result += " -> " + ret_str
-        return result
+            lowered_ret = ""
+        sig = parse_proc_signature(typedef_name, lowered_params, lowered_ret)
+        if sig is None:
+            return _proc_legacy_display(lowered_params, lowered_ret)
+        return format_proc(sig)
 
     def _soa_ptr_display(self, addr: int) -> str:
         # Current Odin DWARF does not encode the element index:
@@ -1241,5 +1366,217 @@ def _default_children(val):
 
 try:
     Odin_Children_Command()
+except Exception:
+    pass  # already registered (re-source safe)
+
+
+# ------------------------------------------------------------------------------
+# odin-call command
+#
+# Usage: odin-call PROC_NAME(ARG, ...)
+#   odin-call add_ints(2, 3)
+#   odin-call foo_value(foo)
+#   odin-call 'main::add_ints'(2, 3)   (imported proc: quote the :: name)
+#
+# Stopped-inferior only; pure procs preferred. Single-return and void
+# procs are fully automatic (hidden &context appended). Multi-return
+# procs need explicit sret slot addresses as trailing args (Phase 1).
+
+import re as _re
+
+
+class Odin_Call_Command(gdb.Command):
+    """Call an Odin procedure with hidden args supplied."""
+
+    def __init__(self) -> None:
+        super().__init__("odin-call", gdb.COMMAND_DATA, gdb.COMPLETE_SYMBOL)
+
+    def invoke(self, arg, from_tty) -> None:
+        text = (arg or "").strip()
+        m = _re.match(r"^([^\s(]+)\s*\((.*)\)\s*$", text, _re.S)
+        if not m:
+            print("Usage: odin-call PROC_NAME(ARG, ...)  e.g. odin-call add_ints(2, 3)")
+            return
+        fn_token, argstr = m.group(1), m.group(2).strip()
+        user_args = (_split_top_level(argstr) if argstr else [])
+        user_args = [a.strip() for a in user_args if a.strip() or len(user_args) == 1]
+        if len(user_args) == 1 and not user_args[0]:
+            user_args = []
+
+        # --- resolve function value + address (both kinds) ---
+        fn_val = None
+        resolved_expr = fn_token
+        try:
+            fn_val = gdb.parse_and_eval(fn_token)
+        except gdb.error:
+            fn_val = None
+        fn_addr = 0
+        if fn_val is not None:
+            try:
+                fn_addr = int(fn_val)
+            except Exception:
+                fn_addr = 0
+            if not fn_addr:
+                # Function designators have no integer value but are still
+                # callable by name; nil proc *variables* (pointer-typed)
+                # keep 0 so the nil refusal still fires.
+                try:
+                    is_func = (fn_val.type.strip_typedefs().code
+                               == gdb.TYPE_CODE_FUNC)
+                except Exception:
+                    is_func = False
+                if is_func:
+                    fn_addr = -1  # resolved-but-addressless marker
+        else:
+            # constant / imported proc: resolve via symbol table
+            # ('pkg::proc' quoting guidance in the usage string above).
+            sym = None
+            for probe in (fn_token, fn_token.strip("'\"")):
+                try:
+                    found = gdb.lookup_symbol(probe)
+                except Exception:
+                    found = None
+                cand = found[0] if isinstance(found, tuple) else found
+                if cand is not None:
+                    sym = cand
+                    break
+            if sym is None:
+                # Resolution discovery (fallback only): this binary emits
+                # DW_AT_name as `<pkg>::<bare>` (e.g. main::add_ints), so a
+                # bare token resolves to nothing above. Probe
+                # `info functions` for the qualified spelling.
+                if "::" not in fn_token:
+                    bare = fn_token.strip("'\"").strip()
+                    if bare:
+                        try:
+                            info = gdb.execute("info functions %s$" % bare,
+                                               to_string=True)
+                        except Exception:
+                            info = ""
+                        m2 = _re.search(r"([\w.]+)::" + _re.escape(bare)
+                                        + r"\s*\(", info or "")
+                        if m2:
+                            qual = m2.group(1)
+                            try:
+                                fn_val = gdb.parse_and_eval("'%s::%s'" % (qual, bare))
+                            except gdb.error:
+                                fn_val = None
+                            if fn_val is not None:
+                                resolved_expr = "'%s::%s'" % (qual, bare)
+                                try:
+                                    fn_addr = int(fn_val)
+                                except Exception:
+                                    fn_addr = 0
+                                if not fn_addr:
+                                    fn_addr = -1  # resolved-but-addressless marker
+                if fn_val is None:
+                    print("error: could not resolve '%s' "
+                          "(for imported procs quote the name: 'pkg::proc')" % fn_token)
+                    return
+            else:
+                try:
+                    fn_val = sym.value()
+                except Exception as e:
+                    print("error: could not read symbol '%s': %s" % (fn_token, e))
+                    return
+                try:
+                    addr_val = fn_val.address
+                    fn_addr = int(addr_val) if addr_val is not None else 0
+                except Exception:
+                    fn_addr = 0
+                if not fn_addr:
+                    # function symbols report no address; still callable by name
+                    fn_addr = -1  # resolved-but-addressless marker
+
+        # --- build signature via the shared parser (no second parser) ---
+        try:
+            ftype = fn_val.type.strip_typedefs()
+        except Exception:
+            print("error: could not read type of '%s'" % fn_token)
+            return
+        try:
+            typedef_name = str(fn_val.type)
+        except Exception:
+            typedef_name = ""
+        if ftype.code == gdb.TYPE_CODE_PTR:
+            try:
+                func_type = ftype.target()
+            except Exception:
+                print("error: '%s' is not a procedure" % fn_token)
+                return
+        elif ftype.code == gdb.TYPE_CODE_FUNC:
+            func_type = ftype
+        else:
+            print("error: '%s' is not a procedure" % fn_token)
+            return
+        try:
+            lowered_params = [type_display(f.type) for f in func_type.fields()]
+        except Exception:
+            lowered_params = []
+        try:
+            lowered_ret = type_display(func_type.target())
+        except Exception:
+            lowered_ret = ""
+        sig = parse_proc_signature(typedef_name, lowered_params, lowered_ret)
+        if sig is None:
+            if typedef_name.lstrip().startswith("proc"):
+                print("error: cannot parse signature of '%s' "
+                      "(inspect with ptype and call the lowered form)" % fn_token)
+                return
+            # C-symbol fallback (fallback only): plain C types carry no proc
+            # typedef, so call the already-lowered form directly (no hidden
+            # context; hidden args still come from sig.hidden_params).
+            written = list(lowered_params)
+            if len(written) == 1 and written[0].strip() == "void":
+                written = []
+            ret_stripped = lowered_ret.strip() if lowered_ret else ""
+            if ret_stripped in ("", "void"):
+                returns = None
+            else:
+                returns = ("single", lowered_ret)
+            sig = ProcSignature(convention="c", written_params=written,
+                                hidden_params=[], returns=returns,
+                                typedef_name=typedef_name)
+
+        # --- plan (nil / arity / lowered refusals are deterministic) ---
+        try:
+            plan = call_plan(sig, resolved_expr, fn_addr, user_args)
+        except ProcCallError as e:
+            print(e)
+            return
+
+        # --- scheduler-locking guard + eval + cleanup ---
+        try:
+            prev_out = gdb.execute("show scheduler-locking", to_string=True)
+        except Exception:
+            prev_out = ""
+        prev_m = _re.search(r"\b(on|off|step)\b", prev_out)
+        prev_mode = prev_m.group(1) if prev_m else "off"
+        try:
+            gdb.execute("set scheduler-locking on")
+        except Exception as e:
+            print("error: cannot set scheduler-locking: %s" % e)
+            return
+        try:
+            try:
+                gdb.execute("print " + plan.expr_string)
+            except gdb.error as e:
+                print("error: call failed: %s" % e)
+                print("hint: lowered signature is: %s"
+                      % _proc_legacy_display(lowered_params, lowered_ret))
+        finally:
+            for thunk in plan.cleanup:
+                try:
+                    thunk()
+                except Exception:
+                    pass
+            try:
+                gdb.execute("set scheduler-locking %s" % prev_mode)
+            except Exception:
+                pass
+
+
+try:
+    Odin_Call_Command()
 except Exception:
     pass  # already registered (re-source safe)

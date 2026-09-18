@@ -19,6 +19,34 @@ Foo_Bar_Union            :: union {Foo, Bar, string}
 Foo_Bar_Union_No_Nill    :: union #no_nil {Foo, Bar}
 Foo_Bar_Union_Shared_Nil :: union #shared_nil {Enum, ^Foo, ^Bar}
 
+// Pure package-level procs used as odin-call fixtures (no globals touched).
+// NOTE: by-value struct args (>16B) can't be called via GDB's C ABI (Odin passes hidden pointer), so fixtures take pointers.
+
+add_ints :: proc (a, b: int) -> int {
+	return a + b
+}
+dup_foo :: proc (f: ^Foo) -> Foo {
+	return f^
+}
+foo_value :: proc (f: ^Foo) -> int {
+	return f.value
+}
+is_big_bar :: proc (b: ^Bar) -> bool {
+	return b.value > 100
+}
+get_magic :: proc () -> int {
+	return 42
+}
+add_ints_contextless :: proc "contextless" (a, b: int) -> int {
+	return a + b
+}
+add_ints_c :: proc "c" (a, b: int) -> int {
+	return a + b
+}
+make_foo :: proc (name: string, v: int) -> Foo {
+	return Foo{name, v}
+}
+
 main :: proc () {
 
 	struct_empty := Struct_Empty{}
@@ -303,6 +331,40 @@ main :: proc () {
 	soa_slice_ptr := &soa_slice[1]
 	// (gdb) print soa_slice_ptr
 	// &[3]{{"SOA1", 1}, {"SOA2", 2}, {"SOA3", 3}}
+
+	// Keep odin-call fixtures alive (prevent dead-code elimination).
+	_ = add_ints
+	_ = dup_foo
+	_ = foo_value
+	_ = is_big_bar
+	_ = get_magic
+	_ = add_ints_contextless
+	_ = add_ints_c
+	_ = make_foo
+
+	// (gdb) odin-call add_ints(2, 3)
+	// 5
+
+	// (gdb) odin-call get_magic()
+	// 42
+
+	// (gdb) odin-call add_ints_contextless(2, 3)
+	// 5
+
+	// (gdb) odin-call add_ints_c(2, 3)
+	// 5
+
+	// (gdb) odin-call is_big_bar(&bar)
+	// false
+
+	// (gdb) odin-call foo_value(&foo)
+	// 42
+
+	// (gdb) odin-call dup_foo(&foo)
+	// {"Hello", 42} = {foo_name = "Hello", value = 42}
+
+	// (gdb) odin-call foo_proc_nil(&foo, bar)
+	// error: proc is nil, refusing to call
 
 	breakpoint() // for gdb to breakpoint here
 	return
